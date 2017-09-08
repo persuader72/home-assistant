@@ -5,10 +5,11 @@ import logging
 import voluptuous as vol
 import async_timeout
 
-from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.http import (
+    HomeAssistantView, RequestDataValidator)
 
-from . import cloud_api
-from .const import DOMAIN, REQUEST_TIMEOUT
+from . import auth_api
+from .const import REQUEST_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,6 +20,10 @@ def async_setup(hass):
     hass.http.register_view(CloudLoginView)
     hass.http.register_view(CloudLogoutView)
     hass.http.register_view(CloudAccountView)
+    hass.http.register_view(CloudRegisterView)
+    hass.http.register_view(CloudConfirmRegisterView)
+    hass.http.register_view(CloudForgotPasswordView)
+    hass.http.register_view(CloudConfirmForgotPasswordView)
 
 
 class CloudLoginView(HomeAssistantView):
@@ -26,52 +31,35 @@ class CloudLoginView(HomeAssistantView):
 
     url = '/api/cloud/login'
     name = 'api:cloud:login'
-    schema = vol.Schema({
-        vol.Required('username'): str,
-        vol.Required('password'): str,
-    })
 
     @asyncio.coroutine
-    def post(self, request):
-        """Validate config and return results."""
-        try:
-            data = yield from request.json()
-        except ValueError:
-            _LOGGER.error('Login with invalid JSON')
-            return self.json_message('Invalid JSON.', 400)
-
-        try:
-            self.schema(data)
-        except vol.Invalid as err:
-            _LOGGER.error('Login with invalid formatted data')
-            return self.json_message(
-                'Message format incorrect: {}'.format(err), 400)
-
+    @RequestDataValidator(vol.Schema({
+        vol.Required('email'): str,
+        vol.Required('password'): str,
+    }))
+    def post(self, request, data):
+        """Handle login request."""
         hass = request.app['hass']
-        phase = 1
+        auth = hass.data['cloud']['auth']
+
         try:
             with async_timeout.timeout(REQUEST_TIMEOUT, loop=hass.loop):
-                cloud = yield from cloud_api.async_login(
-                    hass, data['username'], data['password'])
+                yield from hass.async_add_job(auth.login, data['email'],
+                                              data['password'])
 
-            phase += 1
-
-            with async_timeout.timeout(REQUEST_TIMEOUT, loop=hass.loop):
-                yield from cloud.async_refresh_account_info()
-
-        except cloud_api.Unauthenticated:
-            return self.json_message(
-                'Authentication failed (phase {}).'.format(phase), 401)
-        except cloud_api.UnknownError:
-            return self.json_message(
-                'Unknown error occurred (phase {}).'.format(phase), 500)
+        except auth_api.UserNotFound:
+            return self.json_message("User doesn't exist.", 400)
+        except auth_api.Unauthenticated:
+            return self.json_message('Authentication failed.', 401)
+        except auth_api.PasswordChangeRequired:
+            return self.json_message('Password change required.', 400)
+        except auth_api.UnexpectedError as err:
+            return self.json_message('Unexpected error: {}.'.format(err), 500)
         except asyncio.TimeoutError:
             return self.json_message(
-                'Unable to reach Home Assistant cloud '
-                '(phase {}).'.format(phase), 502)
+                'Unable to reach Home Assistant cloud.', 502)
 
-        hass.data[DOMAIN]['cloud'] = cloud
-        return self.json(cloud.account)
+        return self.json(_auth_data(auth))
 
 
 class CloudLogoutView(HomeAssistantView):
@@ -82,38 +70,167 @@ class CloudLogoutView(HomeAssistantView):
 
     @asyncio.coroutine
     def post(self, request):
-        """Validate config and return results."""
+        """Handle logout request."""
         hass = request.app['hass']
+        auth = hass.data['cloud']['auth']
+
         try:
             with async_timeout.timeout(REQUEST_TIMEOUT, loop=hass.loop):
-                yield from \
-                    hass.data[DOMAIN]['cloud'].async_revoke_access_token()
-
-            hass.data[DOMAIN].pop('cloud')
+                yield from hass.async_add_job(auth.logout)
 
             return self.json({
                 'result': 'ok',
             })
         except asyncio.TimeoutError:
             return self.json_message("Could not reach the server.", 502)
-        except cloud_api.UnknownError as err:
-            return self.json_message(
-                "Error communicating with the server ({}).".format(err.status),
-                502)
+        except auth_api.UnexpectedError as err:
+            return self.json_message("Unexpected error: {}.".format(err), 502)
 
 
 class CloudAccountView(HomeAssistantView):
-    """Log out of the Home Assistant cloud."""
+    """View to retrieve account info."""
 
     url = '/api/cloud/account'
     name = 'api:cloud:account'
 
     @asyncio.coroutine
     def get(self, request):
-        """Validate config and return results."""
+        """Get account info."""
         hass = request.app['hass']
+        auth = hass.data['cloud']['auth']
 
-        if 'cloud' not in hass.data[DOMAIN]:
+        if not auth.is_logged_in:
             return self.json_message('Not logged in', 400)
 
-        return self.json(hass.data[DOMAIN]['cloud'].account)
+        return self.json(_auth_data(auth))
+
+
+class CloudRegisterView(HomeAssistantView):
+    """Register on the Home Assistant cloud."""
+
+    url = '/api/cloud/register'
+    name = 'api:cloud:register'
+
+    @asyncio.coroutine
+    @RequestDataValidator(vol.Schema({
+        vol.Required('email'): str,
+        vol.Required('password'): str,
+    }))
+    def post(self, request, data):
+        """Handle registration request."""
+        hass = request.app['hass']
+
+        try:
+            with async_timeout.timeout(REQUEST_TIMEOUT, loop=hass.loop):
+                yield from hass.async_add_job(
+                    auth_api.register, hass, data['email'], data['password'])
+
+            return self.json({
+                'result': 'ok',
+            })
+        except asyncio.TimeoutError:
+            return self.json_message("Could not reach the server.", 502)
+        except auth_api.UnexpectedError as err:
+            return self.json_message("Unexpected error: {}.".format(err), 502)
+
+
+class CloudConfirmRegisterView(HomeAssistantView):
+    """Confirm registration on the Home Assistant cloud."""
+
+    url = '/api/cloud/confirm_register'
+    name = 'api:cloud:confirm_register'
+
+    @asyncio.coroutine
+    @RequestDataValidator(vol.Schema({
+        vol.Required('confirmation_code'): str,
+        vol.Required('email'): str,
+    }))
+    def post(self, request, data):
+        """Handle registration confirmation request."""
+        hass = request.app['hass']
+
+        try:
+            with async_timeout.timeout(REQUEST_TIMEOUT, loop=hass.loop):
+                yield from hass.async_add_job(
+                    auth_api.confirm_register, hass, data['confirmation_code'],
+                    data['email'])
+
+            return self.json({
+                'result': 'ok',
+            })
+        except asyncio.TimeoutError:
+            return self.json_message("Could not reach the server.", 502)
+        except auth_api.UnexpectedError as err:
+            return self.json_message("Unexpected error: {}.".format(err), 502)
+
+
+class CloudForgotPasswordView(HomeAssistantView):
+    """View to start Forgot Password flow.."""
+
+    url = '/api/cloud/forgot_password'
+    name = 'api:cloud:forgot_password'
+
+    @asyncio.coroutine
+    @RequestDataValidator(vol.Schema({
+        vol.Required('email'): str,
+    }))
+    def post(self, request, data):
+        """Handle forgot password request."""
+        hass = request.app['hass']
+
+        try:
+            with async_timeout.timeout(REQUEST_TIMEOUT, loop=hass.loop):
+                yield from hass.async_add_job(
+                    auth_api.forgot_password, hass, data['email'])
+
+            return self.json({
+                'result': 'ok',
+            })
+        except auth_api.UserNotFound:
+            return self.json_message("User doesn't exist.", 400)
+        except asyncio.TimeoutError:
+            return self.json_message("Could not reach the server.", 502)
+        except auth_api.UnexpectedError as err:
+            return self.json_message("Unexpected error: {}.".format(err), 502)
+
+
+class CloudConfirmForgotPasswordView(HomeAssistantView):
+    """View to finish Forgot Password flow.."""
+
+    url = '/api/cloud/confirm_forgot_password'
+    name = 'api:cloud:confirm_forgot_password'
+
+    @asyncio.coroutine
+    @RequestDataValidator(vol.Schema({
+        vol.Required('confirmation_code'): str,
+        vol.Required('email'): str,
+        vol.Required('new_password'): vol.All(str, vol.Length(min=6))
+    }))
+    def post(self, request, data):
+        """Handle forgot password confirm request."""
+        hass = request.app['hass']
+
+        try:
+            with async_timeout.timeout(REQUEST_TIMEOUT, loop=hass.loop):
+                yield from hass.async_add_job(
+                    auth_api.confirm_forgot_password, hass,
+                    data['confirmation_code'], data['email'],
+                    data['new_password'])
+
+            return self.json({
+                'result': 'ok',
+            })
+        except auth_api.ExpiredCode:
+            return self.json_message(
+                'Invalid code provided, please request a code again.', 400)
+        except asyncio.TimeoutError:
+            return self.json_message("Could not reach the server.", 502)
+        except auth_api.UnexpectedError as err:
+            return self.json_message("Unexpected error: {}.".format(err), 502)
+
+
+def _auth_data(auth):
+    """Generate the auth data JSON response."""
+    return {
+        'email': auth.account.email
+    }
