@@ -1,10 +1,12 @@
 """
-Sensor to indicate whether the current day is a workday.
+Sensor to indicate whether the current day is a workday based on workalendar.
+module. The code is based on binary_sensor.workday home-assistant component
 
 For more details about this platform, please refer to the documentation at
 https://home-assistant.io/components/binary_sensor.workday/
 """
 import asyncio
+import importlib
 import logging
 from datetime import datetime, timedelta
 
@@ -17,33 +19,22 @@ import homeassistant.helpers.config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
 
-REQUIREMENTS = ['holidays==0.8.1']
+REQUIREMENTS = ['workalendar==2.3.1']
 
-# List of all countries currently supported by holidays
-# There seems to be no way to get the list out at runtime
-ALL_COUNTRIES = ['Australia', 'AU', 'Austria', 'AT', 'Canada', 'CA',
-                 'Colombia', 'CO', 'Czech', 'CZ', 'Denmark', 'DK', 'England',
-                 'EuropeanCentralBank', 'ECB', 'TAR', 'Germany', 'DE',
-                 'Ireland', 'Isle of Man', 'Mexico', 'MX', 'Netherlands', 'NL',
-                 'NewZealand', 'NZ', 'Northern Ireland', 'Norway', 'NO',
-                 'Portugal', 'PT', 'PortugalExt', 'PTE', 'Scotland', 'Spain',
-                 'ES', 'UnitedKingdom', 'UK', 'UnitedStates', 'US', 'Wales']
 CONF_COUNTRY = 'country'
-CONF_PROVINCE = 'province'
 CONF_WORKDAYS = 'workdays'
-# By default, Monday - Friday are workdays
-DEFAULT_WORKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri']
+CONF_OFFSET = 'days_offset'
 CONF_EXCLUDES = 'excludes'
-# By default, public holidays, Saturdays and Sundays are excluded from workdays
+
+DEFAULT_WORKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri']
 DEFAULT_EXCLUDES = ['sat', 'sun', 'holiday']
 DEFAULT_NAME = 'Workday Sensor'
-ALLOWED_DAYS = WEEKDAYS + ['holiday']
-CONF_OFFSET = 'days_offset'
 DEFAULT_OFFSET = 0
 
+ALLOWED_DAYS = WEEKDAYS + ['holiday']
+
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_COUNTRY): vol.In(ALL_COUNTRIES),
-    vol.Optional(CONF_PROVINCE, default=None): cv.string,
+    vol.Required(CONF_COUNTRY): cv.string,
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     vol.Optional(CONF_OFFSET, default=DEFAULT_OFFSET): vol.Coerce(int),
     vol.Optional(CONF_WORKDAYS, default=DEFAULT_WORKDAYS):
@@ -55,40 +46,39 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
 
 def setup_platform(hass, config, add_devices, discovery_info=None):
     """Set up the Workday sensor."""
-    import holidays
-
     sensor_name = config.get(CONF_NAME)
     country = config.get(CONF_COUNTRY)
-    province = config.get(CONF_PROVINCE)
     workdays = config.get(CONF_WORKDAYS)
     excludes = config.get(CONF_EXCLUDES)
     days_offset = config.get(CONF_OFFSET)
 
     year = (datetime.now() + timedelta(days=days_offset)).year
-    obj_holidays = getattr(holidays, country)(years=year)
+    components = country.split('.')
 
-    if province:
-        # 'state' and 'prov' are not interchangeable, so need to make
-        # sure we use the right one
-        if (hasattr(obj_holidays, "PROVINCES") and
-                province in obj_holidays.PROVINCES):
-            obj_holidays = getattr(holidays, country)(prov=province,
-                                                      years=year)
-        elif (hasattr(obj_holidays, "STATES") and
-              province in obj_holidays.STATES):
-            obj_holidays = getattr(holidays, country)(state=province,
-                                                      years=year)
-        else:
-            _LOGGER.error("There is no province/state %s in country %s",
-                          province, country)
-            return False
+    if len(components) != 2:
+        _LOGGER.error('You must specify a continent and a country in the form '
+                      'continent.Country')
+        return False
 
+    try:
+        workalendar = importlib.import_module('workalendar.' + components[0])
+    except TypeError:
+        _LOGGER.error('You must specify a continent supported in workalendar')
+        return False
+    except ImportError:
+        return False
+
+    if not hasattr(workalendar, components[1]):
+        _LOGGER.error('You must specify a country supported in workalendar')
+        return False
+
+    calendar = getattr(workalendar, components[1])()
     _LOGGER.debug("Found the following holidays for your configuration:")
-    for date, name in sorted(obj_holidays.items()):
+    for date, name in sorted(calendar.holidays(year)):
         _LOGGER.debug("%s %s", date, name)
 
     add_devices([IsWorkdaySensor(
-        obj_holidays, workdays, excludes, days_offset, sensor_name)], True)
+        calendar, workdays, excludes, days_offset, sensor_name)], True)
 
 
 def day_to_string(day):
@@ -102,10 +92,10 @@ def day_to_string(day):
 class IsWorkdaySensor(BinarySensorDevice):
     """Implementation of a Workday sensor."""
 
-    def __init__(self, obj_holidays, workdays, excludes, days_offset, name):
+    def __init__(self, calendar, workdays, excludes, days_offset, name):
         """Initialize the Workday sensor."""
         self._name = name
-        self._obj_holidays = obj_holidays
+        self.calendar = calendar
         self._workdays = workdays
         self._excludes = excludes
         self._days_offset = days_offset
@@ -125,7 +115,8 @@ class IsWorkdaySensor(BinarySensorDevice):
         """Check if given day is in the includes list."""
         if day in self._workdays:
             return True
-        elif 'holiday' in self._workdays and now in self._obj_holidays:
+        elif 'holiday' in self._workdays and \
+                not self.calendar.is_working_day(now):
             return True
 
         return False
@@ -134,7 +125,8 @@ class IsWorkdaySensor(BinarySensorDevice):
         """Check if given day is in the excludes list."""
         if day in self._excludes:
             return True
-        elif 'holiday' in self._excludes and now in self._obj_holidays:
+        elif 'holiday' in self._excludes and \
+                not self.calendar.is_working_day(now):
             return True
 
         return False
@@ -165,3 +157,4 @@ class IsWorkdaySensor(BinarySensorDevice):
 
         if self.is_exclude(day_of_week, date):
             self._state = False
+
